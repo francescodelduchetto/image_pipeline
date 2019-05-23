@@ -23,6 +23,9 @@
 #include <cv_bridge/cv_bridge.h>
 #include <image_transport/image_transport.h>
 #include <camera_calibration_parsers/parse.h>
+#include <mutex>
+#include <iostream>
+#include <fstream>
 #if CV_MAJOR_VERSION == 3
 #include <opencv2/videoio.hpp>
 #endif
@@ -39,6 +42,11 @@ double min_depth_range;
 double max_depth_range;
 bool use_dynamic_range;
 int colormap;
+std::mutex image_mutex;
+cv::Mat last_image;
+ros::Time first_time;
+ros::Duration last_time;
+
 
 
 void callback(const sensor_msgs::ImageConstPtr& image_msg)
@@ -47,7 +55,7 @@ void callback(const sensor_msgs::ImageConstPtr& image_msg)
 
         cv::Size size(image_msg->width, image_msg->height);
 
-        outputVideo.open(filename, 
+        outputVideo.open(filename,
 #if CV_MAJOR_VERSION >= 3
                 cv::VideoWriter::fourcc(codec.c_str()[0],
 #else
@@ -55,7 +63,7 @@ void callback(const sensor_msgs::ImageConstPtr& image_msg)
 #endif
                           codec.c_str()[1],
                           codec.c_str()[2],
-                          codec.c_str()[3]), 
+                          codec.c_str()[3]),
                 fps,
                 size,
                 true);
@@ -67,14 +75,14 @@ void callback(const sensor_msgs::ImageConstPtr& image_msg)
         }
 
         ROS_INFO_STREAM("Starting to record " << codec << " video at " << size << "@" << fps << "fps. Press Ctrl+C to stop recording." );
-
+        first_time = image_msg->header.stamp;
     }
 
-    if ((image_msg->header.stamp - g_last_wrote_time) < ros::Duration(1.0 / fps))
-    {
-      // Skip to get video with correct fps
-      return;
-    }
+    // if ((image_msg->header.stamp - g_last_wrote_time) < ros::Duration(1.0 / fps))
+    // {
+    //   // Skip to get video with correct fps
+    //   return;
+    // }
 
     try
     {
@@ -84,8 +92,19 @@ void callback(const sensor_msgs::ImageConstPtr& image_msg)
       options.max_image_value = max_depth_range;
       options.colormap = colormap;
       const cv::Mat image = cv_bridge::cvtColorForDisplay(cv_bridge::toCvShare(image_msg), encoding, options)->image;
+      // if (!image.empty()) {
+      //   outputVideo << image;
+      //   ROS_INFO_STREAM("Recording frame " << g_count << "\x1b[1F");
+      //   g_count++;
+      //   g_last_wrote_time = image_msg->header.stamp;
+      // } else {
+      //     ROS_WARN("Frame skipped, no data!");
+      // }
       if (!image.empty()) {
-        outputVideo << image;
+        image_mutex.lock();
+        last_image = image;
+        last_time = first_time - image_msg->header.stamp;
+        image_mutex.unlock();
         ROS_INFO_STREAM("Recording frame " << g_count << "\x1b[1F");
         g_count++;
         g_last_wrote_time = image_msg->header.stamp;
@@ -97,6 +116,21 @@ void callback(const sensor_msgs::ImageConstPtr& image_msg)
         ROS_ERROR("Unable to convert %s image to %s", image_msg->encoding.c_str(), encoding.c_str());
         return;
     }
+}
+
+std::string duration_to_strformat(const ros::Duration duration)
+{
+    int t_minutes;
+    std::string hours, minutes, seconds, mseconds;
+    t_minutes = duration.sec / 60;
+    seconds = std::to_string(int(duration.sec % 60));
+    seconds = ((seconds.length() == 1) ? "0"+seconds : seconds);
+    hours = std::to_string(int(t_minutes / 60));
+    hours = ((hours.length() == 1) ? "0"+hours : hours);
+    minutes = std::to_string(int(t_minutes % 60));
+    minutes = ((minutes.length() == 1) ? "0"+minutes : minutes);
+    mseconds = std::to_string(duration.nsec).substr(0, 3);
+    return hours + ":" + minutes + ":" + seconds + "," + mseconds;
 }
 
 int main(int argc, char** argv)
@@ -136,6 +170,37 @@ int main(int argc, char** argv)
     image_transport::Subscriber sub_image = it.subscribe(topic, 1, callback);
 
     ROS_INFO_STREAM("Waiting for topic " << topic << "...");
-    ros::spin();
+
+    std::ofstream subfile;
+    std::size_t found_d= filename.find_last_of(".");
+    std::string subfilename = filename.substr(0, found_d) + ".srt";
+    subfile.open (subfilename);
+
+    ros::Rate r(fps);
+
+    int n_frame = 0;
+    while (ros::ok()) {
+        if (!last_image.empty()) {
+            image_mutex.lock();
+            // save frame
+            outputVideo << last_image;
+            // TODO save timestamp in srt
+            std::string time_str = duration_to_strformat(last_time);
+            std::cout << time_str << std::endl;
+
+            subfile << n_frame++ << "\n";
+            subfile << time_str << " --> " << time_str << "\n";
+            subfile << time_str << "\n\n";
+
+            image_mutex.unlock();
+        }
+
+        r.sleep();
+    }
+
+    outputVideo.release();
+    subfile.close();
+    // ros::spin();
     std::cout << "\nVideo saved as " << filename << std::endl;
+    std::cout << "\nSubs saved as " << subfilename << std::endl;
 }
